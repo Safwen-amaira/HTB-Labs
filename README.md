@@ -2,7 +2,7 @@
 
 My journey into cybersecurity through Hack The Box labs, one machine at a time.
 
-Welcome to HTB-Labs  my personal repository for documenting my journey as a cybersecurity apprentice through {"fallbackMarkdown":"Hack The Box","reference":{"alt":"Hack The Box","category":"company","extra_params":{"disambiguation":"cybersecurity training platform"},"name":"Hack The Box","prompt_text":"Hack The Box","status":"done","type":"entity"},"referenceKey":"0","showLoginRequiredCard":false} labs.
+Welcome to HTB-Labs  my personal repository for documenting my journey as a cybersecurity apprentice through Hack The Box Labs
 
 This repository contains my walkthroughs, notes, methodologies, commands, discoveries, and lessons learned while working through Hack The Box challenges and machines.
 
