@@ -4,7 +4,7 @@
 
 **Easy · Linux · EU Machines 3**
 
-![Status](https://img.shields.io/badge/status-in--progress-yellow)
+![Status](https://img.shields.io/badge/status-pwned-success)
 ![Difficulty](https://img.shields.io/badge/difficulty-easy-brightgreen)
 ![OS](https://img.shields.io/badge/OS-Linux-blue)
 ![XP](https://img.shields.io/badge/XP-585-orange)
@@ -22,7 +22,7 @@
 | **OS**         | Linux (Ubuntu)     |
 | **Difficulty** | Easy               |
 | **Released**   | 11 July 2026       |
-| **Status**     | ✅ User owned · 🔄 Root in progress |
+| **Status**     | ✅ Fully Rooted |
 
 ---
 
@@ -38,9 +38,10 @@
 * [8. The Second Printer, Now With Traversal](#8-the-second-printer-now-with-traversal)
 * [9. User Flag](#9-user-flag)
 * [10. The Socket That Snitches on Itself](#10-the-socket-that-snitches-on-itself)
-* [11. Where We Currently Stand on Root](#11-where-we-currently-stand-on-root)
-* [12. Summary and Lessons Learned](#12-summary-and-lessons-learned)
-* [13. Tools Used](#13-tools-used)
+* [11. The Password That Just Walks In](#11-the-password-that-just-walks-in)
+* [12. Root Flag](#12-root-flag)
+* [13. Summary and Lessons Learned](#13-summary-and-lessons-learned)
+* [14. Tools Used](#14-tools-used)
 
 ---
 
@@ -95,7 +96,8 @@ For anyone skimming for the actual answers before reading the story, here they a
 | 8 | User flag | `7e81095620bf425c90ec56b7729f3aa3` |
 | 9 | Root owned daemon leaking file descriptors | `paperwork-daemon` via `/run/paperwork/mgmt.sock` |
 | 10 | Leaked admin credential | `ADMIN_PASSWORD=ApparelMortuaryCedar22` |
-| 11 | Root flag | pending, see section 11 |
+| 11 | Root login method | `su - root` with the leaked admin password, no further exploitation needed |
+| 12 | Root flag | `d0d00241b1ad78aac8daf8f7b72e2432` |
 
 ---
 
@@ -622,47 +624,75 @@ Somewhere there is a security engineer who built this alerting system, tested it
 
 ---
 
-# 11. Where We Currently Stand on Root
+# 11. The Password That Just Walks In
 
-Current asset in hand: `ADMIN_PASSWORD=ApparelMortuaryCedar22`, freshly exfiltrated from a root owned config file, courtesy of a security daemon that was supposed to be watching for intruders and instead handed one a snack.
-
-Avenues currently being tested, in order of laziness.
+With `ADMIN_PASSWORD=ApparelMortuaryCedar22` freshly exfiltrated from a root owned config file, courtesy of a security daemon that was supposed to be watching for intruders and instead handed one a snack, the obvious first move was the laziest possible one.
 
 ```bash
 su - root
 ```
 
-then, if that politely refuses:
-
-```bash
-ss -tulpn | grep 973
-find / -path "*/CorpoSite*" 2>/dev/null
-cat /proc/973/cmdline | tr '\0' ' '
-```
-
-since `ps aux` earlier showed a suspicious root owned Python process:
-
 ```text
-root   973  /usr/bin/python3 /root/staging/CorpoSite/app.py
+archivist@paperwork:~$ su - root
+Password:
+Last login: Tue Jul  7 13:54:13 UTC 2026 from 10.10.14.84 on ssh
+root@paperwork:~#
 ```
 
-which smells exactly like an admin panel this password was made for.
+It worked. First try. No pivoting to `/root/staging/CorpoSite/app.py`, no capability abuse, no SUID chain, nothing. The same password that a leaky security daemon handed over turned out to be root's own login password, reused without a hint of shame.
 
-Root has not popped yet as of this writing. This section gets an update, and the status badge finally flips from 🔄 to 👑, the moment that password earns its keep.
+> **📝 My Explanation:**
+
+This is the anticlimactic ending every box occasionally has hiding behind an elaborate front door. Two separate printer protocol vulnerabilities, a command injection, a path traversal, and a file descriptor leak through a supposed intrusion detection system, all of it building up to one final twist: password reuse. Root used the exact same credential that was sitting in a config file meant for something else entirely.
+
+### 💭 Side Thought
+
+The daemon's entire job was to alert on suspicious activity and lock the intruder out. Instead it handed the intruder root's own password in a gift box labeled "forensic evidence." Somewhere, a security consultant is billing this company a lot of money for an audit that is about to get very awkward.
 
 ---
 
-# 12. Summary and Lessons Learned
+# 12. Root Flag
+
+```bash
+root@paperwork:~# ls
+```
+
+```text
+quarantine  root.txt  staging
+```
+
+```bash
+cat root.txt
+```
+
+```text
+d0d00241b1ad78aac8daf8f7b72e2432
+```
+
+### 🚩 Answer
+
+```text
+d0d00241b1ad78aac8daf8f7b72e2432
+```
+
+### 💭 Side Thought
+
+Somehow I never even had to peek inside `staging/CorpoSite` or `quarantine/evidence.zip`. Both are sitting right there in root's home directory, probably holding even more embarrassing secrets about this company's internal tooling, but the box is rooted, and a pentester's curiosity has limits when the flag is already in hand. Maybe next time, `quarantine`. I see you.
+
+---
+
+# 13. Summary and Lessons Learned
 
 - **Two different printer protocols, two different path handling bugs.** If a box runs more than one printer emulator, check every single one of them, they will not share the same standard of quality control.
 - **Never build shell commands out of user controlled strings, even from a protocol older than most of your relatives.** `job_name` walked straight out of an LPD control file into `subprocess.Popen(..., shell=True)` with zero sanitization along the way.
 - **`../` still works in 2026.** Path traversal is the horror movie villain of protocol and web security, you think it is finally dead, and then it is right back in the sequel, wearing a slightly different mask.
 - **A "security alert" feature that leaks file descriptors is worse than having no alert at all.** `SCM_RIGHTS` is powerful and genuinely dangerous, passing a live file descriptor to an untrusted client is functionally identical to handing them root's own keyring.
 - **Do not host your own backend source code behind a link that literally says "Internal Processor."** Just do not. Please.
+- **Password reuse is still the reigning champion of privilege escalation.** All of that clever printer exploitation, and the final door was simply unlocked with the same key found sitting in a completely unrelated drawer.
 
 ---
 
-# 13. Tools Used
+# 14. Tools Used
 
 - `nmap`
 - `nc` and raw Python sockets, for the hand rolled LPD and PJL clients
