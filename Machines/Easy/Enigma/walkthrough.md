@@ -4,6 +4,7 @@
 
 **"Easy" (according to people who clearly didn't do previlege escalation part)**
 
+ 
 ![Status](https://img.shields.io/badge/status-pwned-success)
 ![Difficulty](https://img.shields.io/badge/labeled-easy-brightgreen)
 ![Actual_Difficulty](https://img.shields.io/badge/felt_like-medium%2Fhard-red)
