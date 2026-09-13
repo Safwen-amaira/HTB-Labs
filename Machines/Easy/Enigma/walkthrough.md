@@ -9,6 +9,7 @@
 ![Difficulty](https://img.shields.io/badge/labeled-easy-brightgreen)
 ![Actual_Difficulty](https://img.shields.io/badge/felt_like-medium%2Fhard-red)
 ![OS](https://img.shields.io/badge/OS-Linux-blue)
+
 ![Chain_Length](https://img.shields.io/badge/pivots-5-orange)
 
 </div>
